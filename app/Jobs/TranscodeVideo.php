@@ -7,7 +7,6 @@ use Done\Subtitles\Subtitles;
 use FFMpeg\Format\Video\X264;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
-use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\Storage;
 use Log;
 use ProtoneMedia\LaravelFFMpeg\Support\FFMpeg;
@@ -76,7 +75,8 @@ class TranscodeVideo implements ShouldQueue
 
     /**
      * Execute the job.
-     * @throws ConnectionException
+     *
+     * @throws UserException
      */
     public function handle(): void
     {
@@ -147,11 +147,11 @@ class TranscodeVideo implements ShouldQueue
         FFMpeg::fromDisk('r2_raw')
             ->open($filePath)
             ->export()
-            ->addFilter(['-map', "0:{$streamIndex}"]) // Select only the subtitle stream
+            ->addFilter(['-map', "0:$streamIndex"]) // Select only the subtitle stream
             ->toDisk('r2_hls')
             // Use X264 but disable everything except the mapped stream
             ->inFormat((new X264())->setAdditionalParameters(['-vn', '-an']))
-            ->save("{$videoId}/sub_{$lang}_{$streamIndex}.vtt");
+            ->save("$videoId/sub_{$lang}_$streamIndex.vtt");
     }
 
     /**
@@ -167,8 +167,8 @@ class TranscodeVideo implements ShouldQueue
         $vttContent = $subtitles->loadFromString($srtContent, 'srt')->content('vtt');
 
         // 3. Save the result to your HLS disk
-        Storage::disk('r2_hls')->put("{$videoId}/sub_{$label}.vtt", $vttContent);
+        Storage::disk('r2_hls')->put("$videoId/sub_$label.vtt", $vttContent);
 
-        Log::info("Subtitle converted via mantas-done instance: {$label}");
+        Log::info("Subtitle converted via mantas-done instance: $label");
     }
 }
