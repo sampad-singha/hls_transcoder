@@ -17,8 +17,8 @@ class TestTranscode extends Command
         // Prepare the data your job expects
         $videoData = [
             'video_id' => 'test_folder',
-            'file_path' => 'test5.mp4', // This file must exist in 'storage/app/raw_videos'
-            'subtitle_path' => 'sub_eng_2.srt', // This file must exist in 'storage/app/raw_videos'
+            'file_path' => 'test5.mkv', // This file must exist in 'storage/app/raw_videos'
+//            'subtitle_path' => 'sub_eng_2.srt', // This file must exist in 'storage/app/raw_videos'
         ];
 
         // Dispatch the job
