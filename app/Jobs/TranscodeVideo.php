@@ -8,148 +8,129 @@ use FFMpeg\Format\Video\X264;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Support\Facades\Storage;
-use Log;
 use ProtoneMedia\LaravelFFMpeg\Support\FFMpeg;
 
 class TranscodeVideo implements ShouldQueue
 {
     use Queueable;
 
-    /**
-     * Create a new job instance.
-     */
-    public function __construct(public $videoData)
-    {
-        //
-    }
-
-//    public function handle(): void
-//    {
-//        $filePath = $this->videoData['file_path'];
-//
-//        // 1. Probe the video first using a separate instance
-//        $probe = FFMpeg::fromDisk('r2_raw')->open($filePath);
-//        $dimensions = $probe->getVideoStream()->getDimensions();
-//        $originalHeight = $dimensions->getHeight();
-//
-//        // 2. Define your bitrate ladder
-//        $ladder = [
-//            ['height' => 360,  'width' => 640,  'bitrate' => 500],
-//            ['height' => 720,  'width' => 1280, 'bitrate' => 1500],
-//            ['height' => 1080, 'width' => 1920, 'bitrate' => 3000],
-//            ['height' => 2160, 'width' => 3840, 'bitrate' => 8000]
-//        ];
-//
-//        // 3. Start a FRESH export instance
-//        $export = FFMpeg::fromDisk('r2_raw')
-//            ->open($filePath)
-//            ->exportForHLS();
-//
-//        $addedFormats = 0;
-//
-//        foreach ($ladder as $level) {
-//            // Only add if original is equal or better quality
-//            if ($originalHeight >= $level['height']) {
-//                $format = (new X264)->setKiloBitrate($level['bitrate']);
-//
-//                $export->addFormat($format, function ($media) use ($level) {
-//                    // Use scale() for HLS advanced exports
-//                    $media->scale($level['width'], $level['height']);
-//                });
-//                $addedFormats++;
-//            }
-//        }
-//
-//        // Fallback: If the video is smaller than 360p,
-//        // we still need to add at least ONE format or HLS will fail.
-//        if ($addedFormats === 0) {
-//            $export->addFormat((new X264)->setKiloBitrate(500));
-//        }
-//
-//        // 4. Save to disk
-//        $export->toDisk('r2_hls')
-//            ->save($this->videoData['video_id'] . '/master.m3u8');
-//
-//        Log::info("Transcoding complete for video_id: {$this->videoData['video_id']} (Original: {$originalHeight}p)");
-//    }
+    public function __construct(public $videoData) {}
 
     /**
-     * Execute the job.
-     *
      * @throws UserException
      */
     public function handle(): void
     {
         $filePath = $this->videoData['file_path'];
-        $externalSubPath = $this->videoData['subtitle_path'] ?? null;
+        $externalSubs = $this->videoData['external_subtitles'] ?? [];
         $videoId = $this->videoData['video_id'];
 
         // 1. Open and Probe
         $media = FFMpeg::fromDisk('r2_raw')->open($filePath);
         $originalHeight = $media->getVideoStream()->getDimensions()->getHeight();
+        $allProcessedSubs = [];
 
-        // --- SUBTITLE HANDLING ---
-
-        // Scenario 2: External Subtitle Provided
-        if ($externalSubPath) {
-            $this->convertSrtToVtt($externalSubPath, $videoId, 'external');
+        // --- SUBTITLE HANDLING (Verified Working in your logs) ---
+        foreach ($externalSubs as $sub) {
+            $this->convertSrtToVtt($sub['path'], $videoId, $sub['lang']);
+            $allProcessedSubs[] = [
+                'lang' => $sub['lang'],
+                'uri' => "sub_{$sub['lang']}.vtt"
+            ];
         }
 
-        // Scenario 1: Embedded Subtitles (Extract ALL)
-        foreach ($media->getStreams() as $index => $stream) {
-            // Check if the codec_type is 'subtitle'
+        foreach ($media->getStreams() as $stream) {
             if ($stream->get('codec_type') === 'subtitle') {
                 $lang = $stream->get('tags')['language'] ?? 'und';
-
-                // We need the ACTUAL stream index from the file for mapping
-                // $stream->get('index') is safer than using the loop counter $index
                 $realIndex = $stream->get('index');
-
                 $this->extractEmbeddedSub($filePath, $realIndex, $videoId, $lang);
+                $allProcessedSubs[] = [
+                    'lang' => $lang,
+                    'uri' => "sub_{$lang}_$realIndex.vtt"
+                ];
             }
         }
 
-        // --- VIDEO TRANSCODING ---
+        // --- VIDEO TRANSCODING (Simplified to avoid crashes) ---
         $export = FFMpeg::fromDisk('r2_raw')
             ->open($filePath)
-            ->exportForHLS();
+            ->exportForHLS()
+            ->onProgress(function ($percentage) use ($videoId) {
+                cache()->put("video_progress_$videoId", $percentage, now()->addHours(2));
+            });
 
         $ladder = [
             ['height' => 360,  'width' => 640,  'bitrate' => 500],
             ['height' => 720,  'width' => 1280, 'bitrate' => 1500],
             ['height' => 1080, 'width' => 1920, 'bitrate' => 3000],
-            ['height' => 2160, 'width' => 3840, 'bitrate' => 12000] // Better 4K bitrate
+            ['height' => 2160, 'width' => 3840, 'bitrate' => 12000]
         ];
 
-        $addedFormats = 0;
+        $gpuCodec = config('laravel-ffmpeg.gpu_codec', 'libx264');
+
         foreach ($ladder as $level) {
             if ($originalHeight >= $level['height']) {
-                $format = (new X264)->setKiloBitrate($level['bitrate']);
+
+                // 1. Create an "Unlocked" version of the X264 class
+                $format = new class extends X264 {
+                    public function getAvailableVideoCodecs(): array {
+                        // This bypasses the validation error you were seeing
+                        return ['libx264', 'h264_qsv', 'h264_nvenc', 'h264_amf'];
+                    }
+                };
+
+                // 2. Apply your settings
+                $format->setVideoCodec($gpuCodec);
+                $format->setKiloBitrate($level['bitrate']);
+
+                // 3 UNIVERSAL HARDWARE RULES
+                $params = [];
+
+                // Rule A: Intel QuickSync (Windows/Linux)
+                if (str_contains($gpuCodec, 'qsv')) {
+                    $params = ['-pix_fmt', 'nv12'];
+                }
+
+                // Rule B: Linux Generic Hardware (Intel/AMD)
+                // If it's VAAPI, it ALWAYS needs the device map and upload filter
+                if (str_contains($gpuCodec, 'vaapi')) {
+                    $params = [
+                        '-vaapi_device', '/dev/dri/renderD128',
+                        '-vf', 'format=nv12,hwupload'
+                    ];
+                }
+
+                // Rule C: NVIDIA (Windows/Linux)
+                // NVENC is very smart; it usually needs zero extra flags to work
+                if (str_contains($gpuCodec, 'nvenc')) {
+                    $params = ['-preset', 'p4']; // High quality preset
+                }
+
+                if (!empty($params)) {
+                    $format->setAdditionalParameters($params);
+                }
+
+                // 4. Use the $format variable here
                 $export->addFormat($format, function ($media) use ($level) {
                     $media->scale($level['width'], $level['height']);
                 });
-                $addedFormats++;
             }
         }
 
-        if ($addedFormats === 0) {
-            $export->addFormat((new X264)->setKiloBitrate(500));
-        }
-
+        // 2. Save - The package will automatically name sub-playlists like master_0_500.m3u8
         $export->toDisk('r2_hls')->save($videoId . '/master.m3u8');
+
+        // 3. Update manifest with ALL found subs (External + Embedded)
+        $this->appendSubtitlesToManifest($videoId, $allProcessedSubs);
     }
 
-    /**
-     * Extraction helpers using the underlying FFmpeg driver
-     */
     private function extractEmbeddedSub($filePath, $streamIndex, $videoId, $lang): void
     {
         FFMpeg::fromDisk('r2_raw')
             ->open($filePath)
             ->export()
-            ->addFilter(['-map', "0:$streamIndex"]) // Select only the subtitle stream
+            ->addFilter(['-map', "0:$streamIndex"])
             ->toDisk('r2_hls')
-            // Use X264 but disable everything except the mapped stream
             ->inFormat((new X264())->setAdditionalParameters(['-vn', '-an']))
             ->save("$videoId/sub_{$lang}_$streamIndex.vtt");
     }
@@ -159,16 +140,60 @@ class TranscodeVideo implements ShouldQueue
      */
     private function convertSrtToVtt($subPath, $videoId, $label): void
     {
-        // 1. Get the content from your R2 disk
         $srtContent = Storage::disk('r2_raw')->get($subPath);
-
-        // 2. Instantiate and load (Use standard instance call, not static)
         $subtitles = new Subtitles();
         $vttContent = $subtitles->loadFromString($srtContent, 'srt')->content('vtt');
-
-        // 3. Save the result to your HLS disk
         Storage::disk('r2_hls')->put("$videoId/sub_$label.vtt", $vttContent);
+    }
 
-        Log::info("Subtitle converted via mantas-done instance: $label");
+    private function appendSubtitlesToManifest($videoId, $subs): void
+    {
+        $disk = Storage::disk('r2_hls');
+        $masterPath = "$videoId/master.m3u8";
+
+        if (!$disk->exists($masterPath) || empty($subs)) return;
+
+        $content = $disk->get($masterPath);
+        $subLines = "";
+
+        foreach ($subs as $index => $sub) {
+            $lang = $sub['lang'];
+            $vttUri = $sub['uri'];
+            $playlistName = "playlist_sub_{$lang}_$index.m3u8";
+
+            // 1. Create the secondary subtitle playlist
+            $this->createSubtitlePlaylist($videoId, $playlistName, $vttUri);
+
+            // 2. Point the Master Manifest to the PLAYLIST, not the VTT
+            $isDefault = ($index === 0) ? 'YES' : 'NO';
+            $subLines .= "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"$lang\",DEFAULT=$isDefault,AUTOSELECT=YES,FORCED=NO,LANGUAGE=\"$lang\",URI=\"$playlistName\"\n";
+        }
+
+        // Ensure VERSION:4 is present for subtitle support
+        if (!str_contains($content, '#EXT-X-VERSION')) {
+            $content = str_replace("#EXTM3U", "#EXTM3U\n#EXT-X-VERSION:4", $content);
+        }
+
+        $updatedContent = str_replace("#EXTM3U", "#EXTM3U\n" . $subLines, $content);
+
+        // Link the group to the stream info
+        $updatedContent = preg_replace('/#EXT-X-STREAM-INF:(.*)/', '#EXT-X-STREAM-INF:SUBTITLES="subs",$1', $updatedContent);
+
+        $disk->put($masterPath, $updatedContent);
+    }
+
+    private function createSubtitlePlaylist($videoId, $playlistName, $vttUri): void
+    {
+        // This is the bridge file your examples showed
+        $content = "#EXTM3U\n";
+        $content .= "#EXT-X-VERSION:4\n";
+        $content .= "#EXT-X-TARGETDURATION:10\n"; // Matches your video segment length
+        $content .= "#EXT-X-MEDIA-SEQUENCE:0\n";
+        $content .= "#EXT-X-PLAYLIST-TYPE:VOD\n";
+        $content .= "#EXTINF:10.0,\n"; // Use a dummy value or actual duration
+        $content .= $vttUri . "\n";
+        $content .= "#EXT-X-ENDLIST";
+
+        Storage::disk('r2_hls')->put("$videoId/$playlistName", $content);
     }
 }

@@ -35,4 +35,6 @@ return [
         ],
     ],
 
+    'internal_jwt_secret' => env('INTERNAL_JWT_SECRET'),
+
 ];
