@@ -5,10 +5,14 @@ namespace App\Jobs;
 use Done\Subtitles\Code\Exceptions\UserException;
 use Done\Subtitles\Subtitles;
 use FFMpeg\Format\Video\X264;
+use Firebase\JWT\JWT;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
 use ProtoneMedia\LaravelFFMpeg\Support\FFMpeg;
+use Throwable;
 
 class TranscodeVideo implements ShouldQueue
 {
@@ -18,6 +22,7 @@ class TranscodeVideo implements ShouldQueue
 
     /**
      * @throws UserException
+     * @throws ConnectionException
      */
     public function handle(): void
     {
@@ -122,6 +127,16 @@ class TranscodeVideo implements ShouldQueue
 
         // 3. Update manifest with ALL found subs (External + Embedded)
         $this->appendSubtitlesToManifest($videoId, $allProcessedSubs);
+
+        $this->notifyMainApp('completed');
+    }
+
+    /**
+     * @throws ConnectionException
+     */
+    public function failed(Throwable $exception): void
+    {
+        $this->notifyMainApp('failed', $exception->getMessage());
     }
 
     private function extractEmbeddedSub($filePath, $streamIndex, $videoId, $lang): void
@@ -195,5 +210,37 @@ class TranscodeVideo implements ShouldQueue
         $content .= "#EXT-X-ENDLIST";
 
         Storage::disk('r2_hls')->put("$videoId/$playlistName", $content);
+    }
+
+    /**
+     * @throws ConnectionException
+     */
+    private function notifyMainApp(string $status, ?string $error = null): void
+    {
+        $callbackUrl = $this->videoData['callback_url'] ?? null;
+        if (!$callbackUrl) return;
+
+        // 1. Generate a FRESH token as the MS
+        $payload = [
+            'iss'  => 'video-transcoder',       // The MS identifying itself
+            'aud'  => 'main-app',               // Intended for the Main App
+            'iat'  => time(),
+            'exp'  => time() + 60,              // Valid for only 60 seconds
+            'video_id' => $this->videoData['video_id']
+        ];
+
+        $secret = config('services.internal_jwt_secret'); // Shared secret in both .env files
+        $token = JWT::encode($payload, $secret, 'HS256');
+
+        // 2. Send the request
+        Http::withToken($token)
+            ->timeout(10)
+            ->retry(3, 100)
+            ->post($callbackUrl, [
+                'video_id' => $this->videoData['video_id'],
+                'status'   => $status,
+                'path'     => $status === 'completed' ? "{$this->videoData['video_id']}/master.m3u8" : null,
+                'error'    => $error,
+            ]);
     }
 }

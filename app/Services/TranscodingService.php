@@ -11,14 +11,15 @@ class TranscodingService
 {
     public function trigger(string $videoId, string $rawPath, array $subtitles = []): void
     {
-        // 1. Structure the data exactly as your TranscodeVideo Job handle() expects it
         $videoData = [
             'video_id'           => $videoId,
             'file_path'          => $rawPath,
             'external_subtitles' => $subtitles,
+            // ADD THESE TWO:
+            'callback_url'       => config('main_app_base_url'). "/api/v1/transcode/callback",
+            'auth_token'         => request()->bearerToken(), // Captures the current user's/app's JWT
         ];
 
-        // 2. Dispatch the Job
         TranscodeVideo::dispatch($videoData);
 
         Log::info("Transcoding Job Dispatched for Video: {$videoId}");
