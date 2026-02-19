@@ -23,8 +23,8 @@ class TranscodeVideo implements ShouldQueue
 
     public int $tries = 3;
 
-//    public array $backoff = [60, 300];
-    public array $backoff = [5, 10, 15]; // For testing, shorter backoff times
+    public array $backoff = [60, 300]; // For production, longer backoff times to allow transient issues to resolve
+//    public array $backoff = [5, 10, 15]; // For testing, shorter backoff times
 
     public int $timeout = 7200; // 1 hour
 
