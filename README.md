@@ -1,161 +1,247 @@
-# Video Transcoding Microservice (HLS)
+# Video Transcoding Microservice (HLS + GPU)
 
-## Core Technologies
-* **PHP 8.2+** / **Laravel 11**
-* **FFmpeg** (with `libx264` and `webvtt` support)
-* **ProtoneMedia/Laravel-FFMpeg**
-* **Redis** (Recommended for progress tracking)
-* **Cloudflare R2 / S3** (Storage)
+A high-performance Laravel-based microservice designed to process raw video files into multi-bitrate HLS streams with
+integrated subtitle support and hardware acceleration.
 
 ---
 
-## 1. Setup Requirements
-* **FFmpeg Binaries**: Ensure `ffmpeg` and `ffprobe` are installed on the OS.
-* **Queue Worker**: A dedicated worker must be running:
-  `php artisan queue:work --queue=default`
-* **Cache Store**: Set `CACHE_STORE=redis` in `.env` for real-time progress sharing between the Job and API.
+## 1. Requirements & Stack
 
-### 1.1 Security & Auth
-* **JWT Shared Secret**: Both Main App and Service must share `INTERNAL_JWT_SECRET` in `.env`.
-* **Middleware**: All API routes are protected by the `internal.jwt` middleware.
-* **Postman**: Uses a Pre-request script to generate a Bearer token signed with the shared secret.
+* **PHP 8.2+** & **Laravel 11**
+* **FFmpeg & FFprobe**: Must be installed on the host system.
+* **GPU Drivers**: (Optional) Intel QuickSync (QSV), NVIDIA (NVENC), or VAAPI for hardware acceleration.
+* **Redis**: Required for real-time progress tracking.
+* **Object Storage**: S3-compatible storage (Cloudflare R2, AWS S3) for source and output.
+
 ---
 
-## 2. Video Encoding Ladder
-The service dynamically scales down based on the source height. It will not upscale.
+## 2. Authentication (Service-to-Service)
 
-| Resolution | Label | Bitrate (kbps) | Dimensions |
-| :--- | :--- | :--- | :--- |
-| **4K** | 2160p | 12000 | 3840x2160 |
-| **1080p** | FHD | 3000 | 1920x1080 |
-| **720p** | HD | 1500 | 1280x720 |
-| **360p** | SD | 500 | 640x360 |
+This service uses **M2M (Machine-to-Machine) Symmetric JWT Authentication**. Both the Main App and the Transcoder must
+share an `INTERNAL_JWT_SECRET`.
+
+### JWT Handshake
+
+1. **Main → Transcoder**: Requests must include a Bearer token signed with the shared secret.
+2. **Transcoder → Main (Callback)**: Upon job completion/failure, the Transcoder generates a **new** short-lived (60s)
+   JWT to notify the Main App.
+
+**Standard Claims:**
+
+* `iss`: `video-transcoder` or `main-app`
+* `aud`: The receiving service name.
+* `exp`: `iat + 60` (Short window prevents replay attacks).
 
 ---
 
 ## 3. The Transcoding Workflow
-The service processes a raw video into a multi-bitrate HLS stream with VTT subtitles.
 
+The service follows a strict pipeline to ensure data integrity and HLS compatibility.
 
+### 3.1 Pre-flight Health Check
 
-1.  **Input**: Receives raw file path and optional external SRT paths.
-2.  **Subtitles**:
-    * Converts SRT to VTT using `Done\Subtitles\Subtitles`.
-    * Extracts embedded subtitles using `ffmpeg -map 0:s:{index}`.
-    * **Crucial**: Every `.vtt` is wrapped in its own `.m3u8` subtitle playlist (HLS v4 spec) to ensure player synchronization.
-3.  **Video**: Creates an HLS ladder (360p to 2160p) via `exportForHLS()`.
-4.  **Manifest Update**:
-    * Injects `#EXT-X-MEDIA:TYPE=SUBTITLES` into `master.m3u8`.
-    * Links the subtitle `GROUP-ID` to video variants via the `SUBTITLES="subs"` attribute in the `#EXT-X-STREAM-INF` lines.
+Before a job enters the queue, the `TranscodingService` performs a synchronous probe:
 
----
+* **Integrity**: Runs `ffprobe` to ensure the file header isn't corrupted.
+* **Stream Validation**: Confirms the existence of at least one valid video stream.
+* **Duration Check**: Rejects files with $duration < 1s$.
 
-## 4. API Endpoints
+### 3.2 Subtitle Processing
 
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| **POST** | `/api/v1/transcode` | Dispatches `TranscodeVideo` job. |
-| **GET** | `/api/v1/transcode/progress/{uuid}` | Returns integer `-1` (idle), `0-99` (active), or `100` (done). |
+The engine handles two types of subtitle sources:
 
----
+1. **External (SRT)**: Uses `Done\Subtitles` to convert `.srt` to `.vtt`.
+2. **Embedded**: Uses `ffmpeg -map 0:s:{index}` to extract internal tracks.
+3. **HLS v4 Wrapping**: Every `.vtt` file is wrapped in its own `.m3u8` playlist. This is required for HLS v4+
+   compliance to ensure subtitles sync correctly with video segments.
 
-## 5. Database & Cache Logic
-* **Cache Key**: `video_progress_{uuid}`
-* **Progress Tracking**: Updated via the `onProgress` callback during the export.
-* **Cleanup**: The Service Method automatically calls `cache()->forget($key)` once progress reaches `100` to prevent stale data.
-* **Persistence**: **(TODO)** Implement a database update (e.g., `$video->update(['status' => 'ready'])`) inside the `getTranscodingProgress` check when the value first hits 100.
+### 3.3 Video Transcoding
 
----
+* **Adaptive Ladder**: Generates variants (360p to 2160p) based on the source's original height (no upscaling).
+* **Hardware Acceleration**: Applies specific FFmpeg parameters based on the configured `GPU_CODEC` (QSV, NVENC, or
+  VAAPI).
+* **Progress Tracking**: The `onProgress` callback updates Redis in real-time.
 
-## 6. Troubleshooting / Common Issues
-* **No Subtitles in Player**:
-    * Ensure `master.m3u8` contains the tag `#EXT-X-VERSION:4` at the top.
-    * Verify the `URI` in `#EXT-X-MEDIA` points to the **subtitle playlist** (`.m3u8`), **not** the raw `.vtt` file.
-* **Stuck at 0%**:
-    * Verify the `queue:work` process is active.
-    * Check Redis connectivity if using the Redis cache driver.
-* **Jittery/Resetting Progress**:
-    * Ensure the `onProgress` logic includes a check to only update the cache if the new percentage is greater than the existing cached value (prevents resets when switching bitrate rungs).
+### 3.4 Manifest Injection
+
+The final `master.m3u8` is post-processed to:
+
+* Inject `#EXT-X-VERSION:4`.
+* Define `#EXT-X-MEDIA:TYPE=SUBTITLES` groups.
+* Link the `SUBTITLES="subs"` attribute to every `#EXT-X-STREAM-INF` video variant.
 
 ---
 
-## 7. Postman Monitoring (Loop Script)
-Paste in **Post-res** tab and run via **Collection Runner**:
+## 4. Database & Cache Logic
 
-```javascript
-const progress = parseInt(pm.response.json().progress);
-if (progress >= 0 && progress < 100) {
-    pm.execution.setNextRequest(pm.info.requestName);
-} else {
-    pm.execution.setNextRequest(null);
-}
-````
+### 4.1 Redis Progress Tracking
+
+Progress is tracked via a non-persistent cache to provide high-speed updates for frontend UI polling.
+
+* **Cache Key**: `video_progress_{videoId}`
+* **TTL**: 2 Hours (Prevents stale data from filling Redis if a job is abandoned).
+* **Logic**: The value is an integer `0-100`. A value of `-1` indicates the job is not yet active.
+
+### 4.2 Database Schema (Main App)
+
+The `transcoding_jobs` table serves as the persistent audit log for every file processed.
+
+| Column                 | Type      | Description                                      |
+|:-----------------------|:----------|:-------------------------------------------------|
+| `id`                   | UUID      | Primary Key (matches the `{videoId}`).           |
+| `status`               | String    | `pending`, `processing`, `completed`, `failed`.  |
+| `source_path`          | String    | Location of the raw file in storage.             |
+| `destination_path`     | String    | Final path to the `master.m3u8` manifest.        |
+| `duration`             | Integer   | Length of the video in seconds.                  |
+| `resolution`           | String    | Original dimensions (e.g., `1920x1080`).         |
+| `audio_track_count`    | Integer   | Total detected audio streams.                    |
+| `subtitle_track_count` | Integer   | Total external + embedded subtitle streams.      |
+| `engine_used`          | String    | The codec used for the job (e.g., `h264_nvenc`). |
+| `started_at`           | Timestamp | When the job was dispatched.                     |
+| `completed_at`         | Timestamp | When the callback was successfully received.     |
+
+### 4.3 Data Consistency
+
+1. **Trigger**: Main App creates the DB record as `pending`.
+2. **Webhook**: The Transcoder's `notifyMainApp` call is the **source of truth**.
+3. **Completion**: Upon `status: completed`, the Main App updates the DB and the UI stops polling Redis.
+4. **Cleanup**: The `getTranscodingProgress` service method clears the Redis key once the 100% threshold is reached to
+   maintain cache health.
+
 ---
 
-## 8. JWT & API Payload Structure
+## 5. API Endpoints
 
-### 8.1 JWT Claims (Authentication)
+All endpoints require a valid **Authorization: Bearer {token}** signed with the shared secret using the HS256 algorithm.
 
-The `Authorization: Bearer {token}` header must be signed using `HS256` with the shared secret.
+### 5.1 POST /api/v1/transcode
 
-| Claim | Key | Value | Description |
-| --- | --- | --- | --- |
-| **Issuer** | `iss` | `main-app` | Standard identifier for the calling service. |
-| **Issued At** | `iat` | `timestamp` | Unix timestamp when the token was created. |
-| **Expiration** | `exp` | `iat + 60` | Short-lived window (60s) to prevent replay attacks. |
-| **Audience** | `aud` | `video-transcoder` | Identifies the intended recipient of the token. |
+Dispatches a new transcoding job. The source file must exist on the `r2_raw` disk before calling this endpoint.
 
-### 8.2 API Request Payloads
+**Request Body Fields:**
 
-The following structures define the communication between the Main App and the HLS Service.
+* **video_id** (UUID, Required): Unique identifier for the job and folder naming.
+* **file_path** (String, Required): Path to the source file on the raw disk.
+* **callback_url** (String, Required): The absolute URL the MS calls upon completion or failure.
+* **external_subtitles** (Array, Optional): List of objects containing `lang` and `path`.
 
-**POST** `/api/v1/transcode`
-
+**Example Payload:**
 ```json
 {
     "video_id": "fb1211f8-c461-4d42-a334-2080e770c3c8",
-    "source_path": "uploads/raw/video_01.mp4",
-    "subtitles": [
-        {
-            "lang": "en",
-            "path": "subtitles/english.srt",
-            "type": "external"
-        },
-        {
-            "lang": "fr",
-            "stream_index": 2,
-            "type": "embedded"
-        }
+    "file_path": "uploads/raw/video_01.mp4",
+    "callback_url": "[https://main-app.test/api/v1/transcode/callback](https://www.google.com/search?q=https://main-app.test/api/v1/transcode/callback)",
+    "external_subtitles": [
+        { "lang": "en", "path": "subtitles/english.srt" }
     ]
 }
-
 ```
 
-**GET** `/api/v1/transcode/progress/{video_id}`
+### 5.2 GET /api/v1/transcode/progress/{video_id}
 
+Polls the real-time progress of an active transcoding job from the Redis cache.
+
+**Response Body:**
 ```json
 {
     "video_id": "fb1211f8-c461-4d42-a334-2080e770c3c8",
-    "progress": 85,
-    "status": "processing"
+    "progress": 85
 }
-
 ```
 
-### 8.3 HLS Output Structure
+**Progress Logic:**
 
-Upon reaching `100%`, the generated file tree on the storage disk follows this pattern:
+* **-1**: Job ID not found in cache (Idle or Expired).
+* **0-99**: Job is currently being processed by the GPU/CPU.
+* **100**: Transcoding and manifest generation are complete.
 
-```text
-/transcoded/{video_id}/
-├── master.m3u8           # Multi-variant master playlist
-├── 360p.m3u8             # SD Video playlist
-├── 720p.m3u8             # HD Video playlist
-├── 1080p.m3u8            # FHD Video playlist
-├── subs_en.m3u8          # English Subtitle playlist (VTT)
-├── subs_fr.m3u8          # French Subtitle playlist (VTT)
-└── segments/             # TS and VTT data chunks
-    ├── stream_0_001.ts
-    └── en_001.vtt
+### 5.3 Callback Webhook (Inbound to Main App)
 
+The Transcoder will perform a POST request to the provided `callback_url`. This request is signed with a fresh HS256 JWT
+generated by the Transcoder.
+
+**Example Success Payload:**
+
+```json
+{"video_id": "fb1211f8-c461-4d42-a334-2080e770c3c8",
+    "status": "completed",
+    "path": "fb1211f8.../master.m3u8",
+    "tech_details": {
+        "resolution": "1920x1080",
+        "duration": 450,
+        "audio_count": 2,
+        "subtitle_count": 3,
+        "engine": "h264_nvenc"
+    }
+}
+```
+
+---
+
+## 6. JWT & Authentication
+
+The service utilizes **Symmetric HS256 JWTs** for all service-to-service communication. This ensures that only the Main
+App can start jobs, and only the Transcoder can send updates.
+
+### 6.1 Shared Secret
+
+Both applications must have the following key in their `.env`:
+**INTERNAL_JWT_SECRET=your_secure_random_string**
+
+### 6.2 Token Claims (Handshake)
+
+To prevent replay attacks and ensure identity, tokens must follow this structure:
+
+* **iss (Issuer)**: "main-app" (when calling MS) or "video-transcoder" (when calling Main).
+* **aud (Audience)**: "video-transcoder" or "main-app" (identifies the recipient).
+* **iat (Issued At)**: Current Unix timestamp.
+* **exp (Expiration)**: iat + 60 (Tokens are only valid for 60 seconds).
+
+### 6.3 Security Verification
+
+The receiving service must manually verify the JWT before processing the request:
+
+1. Verify the signature against the shared secret.
+2. Ensure the `exp` claim has not passed.
+3. Validate that the `aud` claim matches the receiving service name.
+
+---
+
+## 6. JWT & Authentication
+
+The service utilizes **Symmetric HS256 JWTs** for all service-to-service communication. This ensures that only the Main App can start jobs, and only the Transcoder can send updates.
+
+### 6.1 Shared Secret
+Both applications must have the following key in their `.env`:
+`INTERNAL_JWT_SECRET=your_long_random_string`
+
+### 6.2 Token Structure (Handshake)
+To prevent replay attacks and impersonation, the tokens follow this contract:
+
+| Claim          | Key   | Value                                             |
+|:---------------|:------|:--------------------------------------------------|
+| **Issuer**     | `iss` | `main-app` (to MS) / `video-transcoder` (to Main) |
+| **Audience**   | `aud` | `video-transcoder` / `main-app`                   |
+| **Expiration** | `exp` | `iat + 60` (Tokens expire after 1 minute)         |
+
+
+
+### 6.3 Callback Verification
+The Main App's callback endpoint must verify:
+1. **Signature**: The token was signed with the `INTERNAL_JWT_SECRET`.
+2. **Audience**: The `aud` claim matches `main-app`.
+3. **Expiration**: The current time is before the `exp` claim.
+
+**MS Implementation Example:**
+```php
+$payload = [
+    'iss'  => 'video-transcoder',
+    'aud'  => 'main-app',
+    'iat'  => time(),
+    'exp'  => time() + 60,
+    'video_id' => $videoId
+];
+
+$token = JWT::encode($payload, config('services.internal_secret'), 'HS256');
+Http::withToken($token)->post($callbackUrl, $data);
 ```
