@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Jobs\TranscodeVideo;
+use App\Models\MediaAsset;
 use Exception;
 use Log;
 use ProtoneMedia\LaravelFFMpeg\Support\FFMpeg;
@@ -16,6 +17,31 @@ class TranscodingService
      */
     public function trigger(string $videoId, string $rawPath, array $subtitles = []): void
     {
+        // 1. Check for existing asset by external_id
+        $asset = MediaAsset::where('external_id', $videoId)->first();
+
+        if ($asset) {
+            // If it's already done or currently working, don't touch it.
+            if (in_array($asset->status, ['completed', 'processing'])) {
+                Log::info("Transcoding skipped for {$videoId}. Current status: {$asset->status}");
+                return;
+            }
+
+            // If it reached here, it means the status is 'failed' or 'pending'.
+            // We "Reset" the asset to prepare for a fresh attempt.
+            $asset->update([
+                'status'        => 'pending',
+                'error_message' => null, // Clear the old error
+            ]);
+        } else {
+            // 2. No existing asset? Create a brand new one.
+            $asset = MediaAsset::create([
+                'external_id' => $videoId,
+                'status'      => 'pending',
+                'disk'        => 'r2_raw'
+            ]);
+        }
+
         try {
             $probe = FFMpeg::fromDisk('r2_raw')->open($rawPath);
             $videoStream = $probe->getVideoStream();
@@ -28,21 +54,34 @@ class TranscodingService
             if ($probe->getDurationInSeconds() < 1) {
                 throw new Exception("Video is too short to process.");
             }
+            // Update asset with basic info before queuing
+            $format = $probe->getFormat();
+
+            $asset->update([
+                'status'     => 'processing',
+                'duration'   => $probe->getDurationInSeconds(),
+                'mime_type'  => $format->get('format_name'),
+                'bitrate'    => (int) $format->get('bit_rate'), // Now it's saved in the service
+                'resolution' => $probe->getVideoStream()->getDimensions()->getWidth() . 'x' . $probe->getVideoStream()->getDimensions()->getHeight(),
+            ]);
 
         } catch (Exception $e) {
             Log::error("Pre-flight failed for {$rawPath}: " . $e->getMessage());
-            // Inform your DB/User that the file is invalid
+            $asset->update([
+                'status'        => 'failed',
+                'error_message' => "Pre-flight: " . $e->getMessage()
+            ]);
+
             throw new Exception($e->getMessage());
         }
 
         $videoData = [
-            'video_id'           => $videoId,
+            'media_asset_id'     => $asset->id, // Use internal UUID
+            'external_id'        => $videoId,   // Use for folder naming
             'file_path'          => $rawPath,
             'external_subtitles' => $subtitles,
-            // ADD THESE TWO:
 //            'callback_url'       => config('main_app_base_url'). "/api/v1/transcode/callback",
             'callback_url'       => "https://webhook.site/9f028353-e262-4bcc-991e-4ce3e7c8ad5f",
-            'auth_token'         => request()->bearerToken(), // Captures the current user's/app's JWT
         ];
 
         TranscodeVideo::dispatch($videoData);
@@ -60,9 +99,6 @@ class TranscodingService
         $progress = cache()->get($cacheKey, -1);
 
         if ($progress >= 100) {
-            // --- TODO: Update Database record for Video ID: $videoId ---
-            // e.g., $video = Video::find($videoId); $video->update(['status' => 'ready']);
-
             // Remove the progress from cache to keep it clean
             cache()->forget($cacheKey);
 
