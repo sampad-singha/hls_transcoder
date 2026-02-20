@@ -19,12 +19,14 @@ class TranscodingController extends Controller
         $data = $request->validate([
             'video_id' => 'required|string',
             'file_path' => 'required|string',
+            'callback_url' => 'required|url',
             'subtitles' => 'array' // Optional array of external subs
         ]);
 
         $this->transcodingService->trigger(
             $data['video_id'],
             $data['file_path'],
+            $data['callback_url'],
             $data['subtitles'] ?? []
         );
 

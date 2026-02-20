@@ -15,7 +15,7 @@ class TranscodingService
     /**
      * @throws Exception
      */
-    public function trigger(string $videoId, string $rawPath, array $subtitles = []): void
+    public function trigger(string $videoId, string $rawPath, string $callback_url, array $subtitles = []): void
     {
         // 1. Check for existing asset by external_id
         $asset = MediaAsset::where('external_id', $videoId)->first();
@@ -80,8 +80,8 @@ class TranscodingService
             'external_id'        => $videoId,   // Use for folder naming
             'file_path'          => $rawPath,
             'external_subtitles' => $subtitles,
-//            'callback_url'       => config('main_app_base_url'). "/api/v1/transcode/callback",
-            'callback_url'       => "https://webhook.site/9f028353-e262-4bcc-991e-4ce3e7c8ad5f",
+//            'callback_url'       => $callback_url,
+            'callback_url'       => "https://webhook.site/d2d41db4-611e-4aa4-80c1-3bc9c4a9854c",
         ];
 
         TranscodeVideo::dispatch($videoData);

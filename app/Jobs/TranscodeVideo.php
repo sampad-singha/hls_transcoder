@@ -12,8 +12,8 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
-use Log;
 use ProtoneMedia\LaravelFFMpeg\Support\FFMpeg;
 use Throwable;
 
@@ -288,6 +288,7 @@ class TranscodeVideo implements ShouldQueue
     private function notifyMainApp(string $status, ?string $error = null): void
     {
         $callbackUrl = $this->videoData['callback_url'] ?? null;
+        Log::warning('Callback URL: ' . ($callbackUrl ?? 'None'));
         if (!$callbackUrl) return;
 
         // 1. Generate a FRESH token as the MS
