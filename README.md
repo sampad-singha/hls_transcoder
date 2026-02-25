@@ -1,3 +1,22 @@
+<div align="center" style="background-color: #f8f9fa; padding: 20px; border-radius: 10px; border: 1px solid #e1e4e8;">
+
+# 🛡️ Open Source & Contributions
+
+---
+
+<p style="color: #24292e; font-size: 1.1em;">
+This project is proudly <strong>open source</strong> and distributed under the <strong>MIT License</strong>. 
+We believe in the power of community collaboration and actively encourage developers of all skill levels to contribute.
+</p>
+
+| 🐛 Found a bug? | 💡 Have a feature idea? |
+| :--- | :--- |
+| [Open an issue](https://github.com/YOUR_USERNAME/YOUR_REPO/issues) | [Submit a pull request](https://github.com/YOUR_USERNAME/YOUR_REPO/pulls) |
+
+---
+
+</div>
+
 # Video Transcoding Microservice (HLS + GPU)
 
 A high-performance Laravel-based microservice designed to process raw video files into multi-bitrate HLS streams with
