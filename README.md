@@ -1,21 +1,10 @@
-<div align="center" style="background-color: #f8f9fa; padding: 20px; border-radius: 10px; border: 1px solid #e1e4e8;">
-
-# 🛡️ Open Source & Contributions
-
----
-
-<p style="color: #24292e; font-size: 1.1em;">
-This project is proudly <strong>open source</strong> and distributed under the <strong>MIT License</strong>. 
-We believe in the power of community collaboration and actively encourage developers of all skill levels to contribute.
-</p>
-
-| 🐛 Found a bug? | 💡 Have a feature idea? |
-| :--- | :--- |
-| [Open an issue](https://github.com/YOUR_USERNAME/YOUR_REPO/issues) | [Submit a pull request](https://github.com/YOUR_USERNAME/YOUR_REPO/pulls) |
-
----
-
-</div>
+> ### Open Source & Contributions
+> ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg) ![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)
+>
+> This project is proudly **open source** and distributed under the **MIT License**. We believe in the power of community collaboration and actively encourage developers of all skill levels to contribute.
+>
+> *  **Found a bug?** [Open an issue](https://github.com/sampad-singha/hls_transcoder/issues)
+> *  **Have a feature idea?** [Submit a pull request](https://github.com/sampad-singha/hls_transcoder/pulls)
 
 # Video Transcoding Microservice (HLS + GPU)
 
@@ -94,39 +83,44 @@ The final `master.m3u8` is post-processed to:
 ## 4. Database & Cache Logic
 
 ### 4.1 Redis Progress Tracking
+The Transcoder service utilizes Redis to broadcast real-time encoding percentages back to the Main App without database overhead.
 
-Progress is tracked via a non-persistent cache to provide high-speed updates for frontend UI polling.
+* **Cache Key**: `video_progress_{videoId}` (Generated during the `onProgress` callback).
+* **TTL**: 2 Hours (Automatic expiration managed by the service to prevent cache bloating).
+* **Logic**: Stores an integer value `0-100`. A value of `-1` is returned via the API if the progress key does not exist or has expired.
 
-* **Cache Key**: `video_progress_{videoId}`
-* **TTL**: 2 Hours (Prevents stale data from filling Redis if a job is abandoned).
-* **Logic**: The value is an integer `0-100`. A value of `-1` indicates the job is not yet active.
+---
 
-### 4.2 Database Schema (Main App)
+### 4.2 Database Schema (Transcoder Service)
+The service utilizes two primary tables to manage state and hardware performance.
 
-The `transcoding_jobs` table serves as the persistent audit log for every file processed.
+**Table: `media_assets`**
 
-| Column                 | Type      | Description                                      |
-|:-----------------------|:----------|:-------------------------------------------------|
-| `id`                   | UUID      | Primary Key (matches the `{videoId}`).           |
-| `status`               | String    | `pending`, `processing`, `completed`, `failed`.  |
-| `source_path`          | String    | Location of the raw file in storage.             |
-| `destination_path`     | String    | Final path to the `master.m3u8` manifest.        |
-| `duration`             | Integer   | Length of the video in seconds.                  |
-| `resolution`           | String    | Original dimensions (e.g., `1920x1080`).         |
-| `audio_track_count`    | Integer   | Total detected audio streams.                    |
-| `subtitle_track_count` | Integer   | Total external + embedded subtitle streams.      |
-| `engine_used`          | String    | The codec used for the job (e.g., `h264_nvenc`). |
-| `started_at`           | Timestamp | When the job was dispatched.                     |
-| `completed_at`         | Timestamp | When the callback was successfully received.     |
+| Column      | Type   | Description                                   |
+|:------------|:-------|:----------------------------------------------|
+| `id`        | UUID   | Primary Key (matches the external `videoId`). |
+| `file_path` | String | Local or cloud path to the source file.       |
+| `disk`      | String | Storage disk identifier (e.g., `r2_hls`).     |
+
+**Table: `transcoding_jobs`**
+
+| Column           | Type      | Description                                                     |
+|:-----------------|:----------|:----------------------------------------------------------------|
+| `id`             | UUID      | Primary Key.                                                    |
+| `media_asset_id` | UUID      | Foreign Key linking to the `media_assets` table.                |
+| `status`         | String    | Lifecycle state: `processing`, `completed`, `failed`.           |
+| `engine`         | String    | The hardware codec used (e.g., `h264_nvenc`, `h264_qsv`).       |
+| `error_message`  | Text      | Captured exception logs if the process terminates unexpectedly. |
+| `started_at`     | Timestamp | Timestamp when the FFmpeg process is spawned.                   |
+| `completed_at`   | Timestamp | Timestamp when HLS segments are finalized and uploaded.         |
+
+---
 
 ### 4.3 Data Consistency
-
-1. **Trigger**: Main App creates the DB record as `pending`.
-2. **Webhook**: The Transcoder's `notifyMainApp` call is the **source of truth**.
-3. **Completion**: Upon `status: completed`, the Main App updates the DB and the UI stops polling Redis.
-4. **Cleanup**: The `getTranscodingProgress` service method clears the Redis key once the 100% threshold is reached to
-   maintain cache health.
-
+1. **State Initialization**: Upon receiving a job, a local `TranscodingJob` is created with `status: processing`.
+2. **Authoritative Callback**: The `notifyMainApp()` function sends an internal JWT-signed (HS256) request to the Main App. This is the **source of truth** for external state updates.
+3. **Hardware Resiliency**: If the `FFMPEG_GPU_CODEC` fails to initialize, the error is caught in the `failed()` method and synchronized with both local and remote databases.
+4. **Automated Cleanup**: On job failure, the service executes a directory-level delete on the `r2_hls` disk to remove orphaned `.ts` segments and manifest files.
 ---
 
 ## 5. API Endpoints
